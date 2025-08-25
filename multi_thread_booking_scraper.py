@@ -2,6 +2,8 @@ import re
 import time
 import csv
 import threading
+import uuid
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -12,7 +14,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select
 from collections import defaultdict
 import requests
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 
 # Global lock for CSV writing
@@ -384,9 +386,14 @@ def extract_category(driver):
         )
         text = element.text.strip()
 
-        # Extract category from parentheses
-        match = re.search(r'\(([^)]+)\)', text)
-        category = match.group(1) if match else text
+        # Extract category from the SECOND pair of parentheses counting from the end.
+        matches = re.findall(r'\(([^)]+)\)', text)
+        if len(matches) >= 2:
+            category = matches[-2]  # second from the end
+        elif matches:
+            category = matches[-1]  # only one pair present
+        else:
+            category = text
 
         # Normalize categories
         if category == 'Guest House':
@@ -471,26 +478,28 @@ def scrape_property_data(driver, url, thread_id=None):
     print(f"{prefix}Scraping: {url}")
 
     data = {
+        'property_id': str(uuid.uuid4()),
+        'scrape_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'property_url': url,
         'category': None,
-        'general_review': 0,
-        'general_review_count': 0,
-        'comfort_score': 0,
-        'value_score': 0,
-        'location_score': 0,
-        'wifi_score': 0,
-        'avg_review_score_all': 0,
-        'avg_review_score_all_count': 0,
-        'avg_review_score_families': 0,
-        'avg_review_score_families_count': 0,
-        'avg_review_score_couples': 0,
-        'avg_review_score_couples_count': 0,
-        'avg_review_score_solo_travelers': 0,
-        'avg_review_score_solo_travelers_count': 0,
-        'avg_review_score_business_travellers': 0,
-        'avg_review_score_business_travellers_count': 0,
-        'min_price': 0,
-        'max_price': 0,
+        'general_review': None,
+        'general_review_count': None,
+        'comfort_score': None,
+        'value_score': None,
+        'location_score': None,
+        'wifi_score': None,
+        'avg_review_score_all': None,
+        'avg_review_score_all_count': None,
+        'avg_review_score_families': None,
+        'avg_review_score_families_count': None,
+        'avg_review_score_couples': None,
+        'avg_review_score_couples_count': None,
+        'avg_review_score_solo_travelers': None,
+        'avg_review_score_solo_travelers_count': None,
+        'avg_review_score_business_travellers': None,
+        'avg_review_score_business_travellers_count': None,
+        'min_price': None,
+        'max_price': None,
         'latitude': None,
         'longitude': None,
         'address': None,
@@ -660,6 +669,8 @@ def scrape_property_data(driver, url, thread_id=None):
 def get_all_possible_fields():
     """Define all possible CSV fields to ensure consistent column ordering"""
     return [
+        'property_id',
+        'scrape_timestamp',
         'property_url',
         'category',
         'general_review',
