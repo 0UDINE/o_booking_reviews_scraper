@@ -87,10 +87,13 @@ def scrape_property_urls(urls):
             for link in links:
                 href = link.get_attribute('href')
                 if href:
+                    # Keep query parameters (checkin, checkout, guests, etc.) in the URL so that
+                    # subsequent price scraping loads the correct availability context. We still
+                    # deduplicate by the canonical part of the URL.
                     canonical = href.split('?')[0]
                     if canonical not in seen:
                         seen.add(canonical)
-                        all_urls.append(canonical)
+                        all_urls.append(href)
 
             print(f"Found {len([l for l in links if l.get_attribute('href')])} properties")
 
@@ -308,6 +311,71 @@ def process_specific_traveler_category(driver, category_value, prefix=""):
         return {'address': None, 'zone': None, 'city': None}
 
 
+def extract_prices(driver):
+    """Return (min_price, max_price) from current Booking.com property page.
+    Strategy:
+    1. Wait for price table cells to appear and scrape helper spans (current Booking markup).
+    2. Fallback to a generic selector list.
+    3. Final fallback: regex on page source.
+    """
+
+    prices = []
+
+    # --- Primary (current markup) ---
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "td.hprt-table-cell-price"))
+        )
+        price_elements = driver.find_elements(
+            By.CSS_SELECTOR,
+            "td.hprt-table-cell-price div.hprt-price-block div.prco-wrapper span.prco-valign-middle-helper",
+        )
+        for el in price_elements:
+            txt = el.text.strip()
+            if not txt:
+                continue
+            num = "".join(filter(str.isdigit, txt))
+            if num:
+                try:
+                    prices.append(int(num))
+                except ValueError:
+                    pass
+    except Exception:
+        pass  # timeout or structure changed – continue with fallbacks
+
+    # --- Fallback: generic selectors ---
+    if not prices:
+        generic_selectors = [
+            "td.hp-price-left-align.hprt-table-cell.hprt-table-cell-price div.hprt-price-block span.prc-no-css",
+            "td.hprt-table-cell-price span.prc-no-css",
+            "div.hprt-price-block span.prc-no-css",
+            "span[data-testid='price-and-discounted-price']",
+            "div[data-testid='price-and-discounted-price']",
+            "span.hprt-price-price-standard",
+            "span.fcab3ed991.bd73d13072",
+        ]
+        for css in generic_selectors:
+            for el in driver.find_elements(By.CSS_SELECTOR, css):
+                txt = el.text.strip()
+                if not txt:
+                    continue
+                digits = re.findall(r"\d+", txt.replace(",", ""))
+                if digits:
+                    try:
+                        prices.append(int("".join(digits)))
+                    except ValueError:
+                        pass
+
+    # --- Final fallback: regex over HTML ---
+    if not prices:
+        matches = re.findall(r"[€$£]\s?(\d{2,5})", driver.page_source)
+        prices.extend([int(m) for m in matches])
+
+    if not prices:
+        return None, None
+    return min(prices), max(prices)
+
+
 def extract_category(driver):
     """Extract property category"""
     try:
@@ -440,42 +508,9 @@ def scrape_property_data(driver, url, thread_id=None):
 
         # Extract prices (min_price & max_price)
         try:
-            price_selectors = [
-                # Room table selector using new class names
-                "td.hp-price-left-align.hprt-table-cell.hprt-table-cell-price div.hprt-price-block span.prc-no-css",
-                "td.hprt-table-cell-price span.prc-no-css",
-                "div.hprt-price-block span.prc-no-css",
-                # Generic price containers used across Booking.com
-                "span[data-testid='price-and-discounted-price']",
-                "div[data-testid='price-and-discounted-price']",
-                # Additional fallbacks
-                "span.hprt-price-price-standard",
-                "span.fcab3ed991.bd73d13072",
-            ]
-
-            prices = []
-            for css in price_selectors:
-                elements = driver.find_elements(By.CSS_SELECTOR, css)
-                for el in elements:
-                    text = el.text.strip()
-                    if not text:
-                        continue
-                    # Remove thousand separators / spaces and keep digits only
-                    digits = re.findall(r"\d+", text.replace(",", ""))
-                    if digits:
-                        try:
-                            prices.append(int("".join(digits)))
-                        except ValueError:
-                            pass
-
-            # As a last resort, parse page source for currency + digits patterns
-            if not prices:
-                matches = re.findall(r"[€$£]\s?(\d{2,5})", driver.page_source)
-                prices.extend([int(m) for m in matches])
-
-            if prices:
-                data['min_price'] = min(prices)
-                data['max_price'] = max(prices)
+            min_p, max_p = extract_prices(driver)
+            data['min_price'] = min_p
+            data['max_price'] = max_p
         except Exception as e:
             print(f"{prefix}Error extracting prices: {e}")
 
