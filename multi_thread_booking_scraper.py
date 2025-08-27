@@ -22,8 +22,8 @@ csv_lock = threading.Lock()
 
 # === TESTING LIMITS ===
 # Set these to None or 0 to disable the limits
-TEST_MAX_PROPERTIES = 15        # scrape only first 15 properties
-TEST_MAX_REVIEW_PAGES = 2       # first page + one extra page (click next once)
+TEST_MAX_PROPERTIES = 200       # scrape only first 200 properties
+TEST_MAX_REVIEW_PAGES = 20       # first page + one extra page (click next once)
 
 
 
@@ -49,8 +49,8 @@ def build_urls(destinations):
     return urls
 
 
-def scrape_property_urls(urls):
-    """Scrape property URLs from search results"""
+def scrape_property_urls(urls, max_links=500):
+    """Scrape property URLs from search results until reaching max_links"""
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
     driver.maximize_window()
     all_urls = []
@@ -58,6 +58,9 @@ def scrape_property_urls(urls):
 
     try:
         for search_url in urls:
+            if len(all_urls) >= max_links:  # stop if enough links already collected
+                break
+
             print(f"Navigating to: {search_url}")
             driver.get(search_url)
 
@@ -70,8 +73,14 @@ def scrape_property_urls(urls):
             except TimeoutException:
                 pass
 
-            # Load all results
+            # Load all results (but can be interrupted once max reached)
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+
             while True:
+                if len(all_urls) >= max_links:
+                    break  # stop if enough links collected
+
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(2)
 
@@ -87,24 +96,21 @@ def scrape_property_urls(urls):
             # Extract property URLs
             links = driver.find_elements(By.XPATH, '//a[@data-testid="title-link"]')
             for link in links:
+                if len(all_urls) >= max_links:  # stop collecting further
+                    break
+
                 href = link.get_attribute('href')
                 if href:
-                    # Keep query parameters (checkin, checkout, guests, etc.) in the URL so that
-                    # subsequent price scraping loads the correct availability context. We still
-                    # deduplicate by the canonical part of the URL.
                     canonical = href.split('?')[0]
                     if canonical not in seen:
                         seen.add(canonical)
                         all_urls.append(href)
 
-            print(f"Found {len([l for l in links if l.get_attribute('href')])} properties")
+            print(f"Collected {len(all_urls)} unique properties so far")
 
     finally:
         driver.quit()
 
-    # Limit number of properties during testing
-    if TEST_MAX_PROPERTIES:
-        return all_urls[:TEST_MAX_PROPERTIES]
     return all_urls
 
 
@@ -918,7 +924,7 @@ def scrape_single_threaded(destinations, batch_size=10):
 
 
 if __name__ == "__main__":
-    cities = ["Marrakesh"]
+    cities = ["Tangier"]
 
     print("Choose scraping mode:")
     print("1. Multi-threaded (faster)")
