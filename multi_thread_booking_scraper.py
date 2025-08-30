@@ -8,9 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+import os
 from selenium.webdriver.support.ui import Select
 from collections import defaultdict
 import requests
@@ -22,9 +23,41 @@ csv_lock = threading.Lock()
 
 # === TESTING LIMITS ===
 # Set these to None or 0 to disable the limits
-TEST_MAX_PROPERTIES = 200       # scrape only first 200 properties
-TEST_MAX_REVIEW_PAGES = 20       # first page + one extra page (click next once)
+TEST_MAX_PROPERTIES = 200  # scrape only first 200 properties
+TEST_MAX_REVIEW_PAGES = 20  # first page + one extra page (click next once)
 
+
+def init_driver():
+    """Initialize and return a remote Chrome WebDriver."""
+    chrome_options = Options()
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--headless=new')  # Ensure headless mode is enabled for server environments
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument('--disable-extensions')
+    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
+
+    # Connect to the Selenium Hub/Node using the service name from docker-compose.yml
+    selenium_url = os.environ.get('SELENIUM_URL', 'http://selenium:4444/wd/hub')
+
+    driver = webdriver.Remote(
+        command_executor=selenium_url,
+        options=chrome_options
+    )
+
+    # Set timeouts
+    driver.set_page_load_timeout(30)
+    driver.set_script_timeout(30)
+
+    # Execute script to remove webdriver flag
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    return driver
 
 
 def build_urls(destinations):
@@ -51,18 +84,18 @@ def build_urls(destinations):
 
 def scrape_property_urls(urls, max_links=500):
     """Scrape property URLs from search results until reaching max_links"""
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
-    driver.maximize_window()
+    driver = init_driver()
     all_urls = []
     seen = set()  # Track canonical property URLs to avoid duplicates
 
     try:
         for search_url in urls:
-            if len(all_urls) >= max_links:  # stop if enough links already collected
+            if len(all_urls) >= max_links:
                 break
 
             print(f"Navigating to: {search_url}")
             driver.get(search_url)
+            time.sleep(3)  # Give page more time to load
 
             # Handle cookie consent
             try:
@@ -70,44 +103,111 @@ def scrape_property_urls(urls, max_links=500):
                     EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler"))
                 )
                 accept_btn.click()
+                print("Cookie consent accepted")
             except TimeoutException:
-                pass
+                print("No cookie consent button found")
 
-            # Load all results (but can be interrupted once max reached)
+            # Debug: Save page source to check what we're getting
+            with open('/app/results/debug_page.html', 'w', encoding='utf-8') as f:
+                f.write(driver.page_source[:10000])  # Save first 10k chars for debugging
+
+            # Try multiple selectors for property links
+            property_selectors = [
+                '//a[@data-testid="title-link"]',
+                '//h3[@data-testid="title"]/a',
+                '//div[@data-testid="property-card"]//a[contains(@href, "/hotel/")]',
+                '//a[contains(@class, "e13098a59f") and contains(@href, "/hotel/")]',
+                '//a[contains(@href, "/hotel/") and not(contains(@href, "#"))]',
+                '//div[contains(@class, "sr_property_block")]//a[contains(@class, "hotel_name_link")]',
+                '//a[contains(@class, "js-sr-hotel-link")]',
+            ]
+
+            # Initial wait and scroll
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
+            time.sleep(3)
 
-            while True:
+            scroll_attempts = 0
+            max_scroll_attempts = 10
+
+            while scroll_attempts < max_scroll_attempts:
                 if len(all_urls) >= max_links:
-                    break  # stop if enough links collected
+                    break
 
+                scroll_attempts += 1
+                print(f"Scroll attempt {scroll_attempts}/{max_scroll_attempts}")
+
+                # Try to find property links with various selectors
+                links_found = False
+                for selector in property_selectors:
+                    try:
+                        links = driver.find_elements(By.XPATH, selector)
+                        if links:
+                            print(f"Found {len(links)} links with selector: {selector}")
+                            links_found = True
+
+                            for link in links:
+                                if len(all_urls) >= max_links:
+                                    break
+
+                                try:
+                                    href = link.get_attribute('href')
+                                    if href and '/hotel/' in href:
+                                        canonical = href.split('?')[0]
+                                        if canonical not in seen:
+                                            seen.add(canonical)
+                                            all_urls.append(href)
+                                except Exception as e:
+                                    print(f"Error extracting href: {e}")
+                            break
+                    except Exception as e:
+                        continue
+
+                if not links_found:
+                    print("No property links found with any selector")
+
+                    # Check if we're on a captcha or error page
+                    page_text = driver.find_element(By.TAG_NAME, 'body').text.lower()
+                    if 'captcha' in page_text or 'verify' in page_text:
+                        print("WARNING: Possible captcha detected")
+                    elif 'no properties found' in page_text or 'no results' in page_text:
+                        print("No properties found for this search")
+                        break
+
+                # Scroll down
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(2)
 
+                # Try to click "Load more" button
                 try:
-                    more_btn = WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, ".//span[contains(text(), ' more results')]"))
-                    )
-                    more_btn.click()
-                    time.sleep(3)
-                except (NoSuchElementException, TimeoutException):
+                    load_more_selectors = [
+                        "//button[contains(text(), 'Load more')]",
+                        "//button[contains(text(), 'Show more')]",
+                        "//span[contains(text(), 'more results')]",
+                        "//button[@data-testid='pagination-next-btn']"
+                    ]
+
+                    for btn_selector in load_more_selectors:
+                        try:
+                            more_btn = driver.find_element(By.XPATH, btn_selector)
+                            if more_btn.is_displayed() and more_btn.is_enabled():
+                                driver.execute_script("arguments[0].click();", more_btn)
+                                print(f"Clicked load more button: {btn_selector}")
+                                time.sleep(3)
+                                break
+                        except:
+                            continue
+                except:
+                    pass
+
+                print(f"Collected {len(all_urls)} unique properties so far")
+
+                # If we haven't found any links after several attempts, break
+                if scroll_attempts > 3 and len(all_urls) == 0:
+                    print("No properties found after multiple attempts, moving to next destination")
                     break
 
-            # Extract property URLs
-            links = driver.find_elements(By.XPATH, '//a[@data-testid="title-link"]')
-            for link in links:
-                if len(all_urls) >= max_links:  # stop collecting further
-                    break
-
-                href = link.get_attribute('href')
-                if href:
-                    canonical = href.split('?')[0]
-                    if canonical not in seen:
-                        seen.add(canonical)
-                        all_urls.append(href)
-
-            print(f"Collected {len(all_urls)} unique properties so far")
-
+    except Exception as e:
+        print(f"Error in scrape_property_urls: {e}")
     finally:
         driver.quit()
 
@@ -280,53 +380,60 @@ def process_specific_traveler_category(driver, category_value, prefix=""):
         print(f"{prefix}Error processing {category_value}: {e}")
 
     return scores
-    """Get location details from coordinates"""
+
+
+def get_location_details(lat, lon):
+    """Reverse-geocode latitude/longitude to address, zone and city (using Nominatim)."""
     try:
-        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&accept-language=en"
-        response = requests.get(url, headers={'User-Agent': 'BookingScraper/1.0'}, timeout=10)
+        url = (
+            "https://nominatim.openstreetmap.org/reverse?format=json"
+            f"&lat={lat}&lon={lon}&accept-language=en"
+        )
+        headers = {
+            "User-Agent": "BookingScraper/1.0 (contact@example.com)"
+        }
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
 
-        address_components = data.get('address', {})
-        latin_pattern = re.compile(r'[^a-zA-Z0-9\s\-,\.\']')
+        address_components = data.get("address", {})
+        latin_pattern = re.compile(r"[^a-zA-Z0-9\s\-,\.']")
 
-        # Clean address
-        address = latin_pattern.sub('', data.get('display_name', '')).strip()
+        # Raw display name cleaned
+        address = latin_pattern.sub("", data.get("display_name", "")).strip()
         if address:
-            address = address.replace(',', ' ')
+            address = address.replace(",", " ")
 
-        # Get zone
+        # Extract zone (neighbourhood/suburb…)
         zone = None
-        zone_fields = ['neighbourhood', 'suburb', 'quarter', 'city_district', 'district']
-        for field in zone_fields:
+        for field in [
+            "neighbourhood",
+            "suburb",
+            "quarter",
+            "city_district",
+            "district",
+        ]:
             if field in address_components and address_components[field]:
-                zone = latin_pattern.sub('', address_components[field]).strip()
+                zone = latin_pattern.sub("", address_components[field]).strip()
                 if zone:
                     break
 
-        # Get city
+        # Extract city
         city = None
-        city_fields = ['city', 'town', 'municipality', 'village']
-        for field in city_fields:
+        for field in ["city", "town", "municipality", "village"]:
             if field in address_components and address_components[field]:
                 city = address_components[field].strip()
                 break
 
-        return {'address': address, 'zone': zone, 'city': city}
+        return {"address": address, "zone": zone, "city": city}
 
     except Exception as e:
         print(f"Error getting location: {e}")
-        return {'address': None, 'zone': None, 'city': None}
+        return {"address": None, "zone": None, "city": None}
 
 
 def extract_prices(driver):
-    """Return (min_price, max_price) from current Booking.com property page.
-    Strategy:
-    1. Wait for price table cells to appear and scrape helper spans (current Booking markup).
-    2. Fallback to a generic selector list.
-    3. Final fallback: regex on page source.
-    """
-
+    """Return (min_price, max_price) from current Booking.com property page."""
     prices = []
 
     # --- Primary (current markup) ---
@@ -349,7 +456,7 @@ def extract_prices(driver):
                 except ValueError:
                     pass
     except Exception:
-        pass  # timeout or structure changed – continue with fallbacks
+        pass  # timeout or structure changed — continue with fallbacks
 
     # --- Fallback: generic selectors ---
     if not prices:
@@ -428,56 +535,6 @@ def extract_coordinates(page_source):
     return None, None
 
 
-def get_location_details(lat, lon):
-    """Reverse-geocode latitude/longitude to address, zone and city (using Nominatim)."""
-    try:
-        url = (
-            "https://nominatim.openstreetmap.org/reverse?format=json"
-            f"&lat={lat}&lon={lon}&accept-language=en"
-        )
-        headers = {
-            "User-Agent": "BookingScraper/1.0 (contact@example.com)"
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-
-        address_components = data.get("address", {})
-        latin_pattern = re.compile(r"[^a-zA-Z0-9\s\-,\.']")
-
-        # Raw display name cleaned
-        address = latin_pattern.sub("", data.get("display_name", "")).strip()
-        if address:
-            address = address.replace(",", " ")
-
-        # Extract zone (neighbourhood/suburb…)
-        zone = None
-        for field in [
-            "neighbourhood",
-            "suburb",
-            "quarter",
-            "city_district",
-            "district",
-        ]:
-            if field in address_components and address_components[field]:
-                zone = latin_pattern.sub("", address_components[field]).strip()
-                if zone:
-                    break
-
-        # Extract city
-        city = None
-        for field in ["city", "town", "municipality", "village"]:
-            if field in address_components and address_components[field]:
-                city = address_components[field].strip()
-                break
-
-        return {"address": address, "zone": zone, "city": city}
-
-    except Exception as e:
-        print(f"Error getting location: {e}")
-        return {"address": None, "zone": None, "city": None}
-
-
 def scrape_property_data(driver, url, thread_id=None):
     """Scrape detailed data for a single property"""
     prefix = f"Thread {thread_id}: " if thread_id else ""
@@ -544,22 +601,22 @@ def scrape_property_data(driver, url, thread_id=None):
 
             # Try multiple selectors because Booking may render the button differently per property
             review_selectors = [
-                (By.XPATH, "//*[@id='js--hp-gallery-scorecard']"),  # score card at the top of gallery (xpath)
-                (By.CSS_SELECTOR, "a[data-testid='see-all-reviews-link']"),  # explicit "See all reviews" link
-                (By.CSS_SELECTOR, "a[href*='#tab-reviews']"),  # anchor link within the same page
+                (By.XPATH, "//*[@id='js--hp-gallery-scorecard']"),
+                (By.CSS_SELECTOR, "a[data-testid='see-all-reviews-link']"),
+                (By.CSS_SELECTOR, "a[href*='#tab-reviews']"),
             ]
 
             clicked = False
             for by, selector in review_selectors:
                 try:
                     review_btn = WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.ID, "js--hp-gallery-scorecard"))
+                        EC.element_to_be_clickable((by, selector))
                     )
                     review_btn.click()
                     clicked = True
                     break
                 except Exception:
-                    continue  # try next selector
+                    continue
 
             if not clicked:
                 print(f"{prefix}Unable to locate reviews link with known selectors")
@@ -782,8 +839,7 @@ def worker_thread(urls_chunk, thread_id, filename, batch_size=5):
     """Worker function for threading"""
     print(f"Thread {thread_id}: Starting with {len(urls_chunk)} properties")
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
-    driver.maximize_window()
+    driver = init_driver()
 
     batch = []
     processed = 0
@@ -828,15 +884,27 @@ def scrape_booking_properties(destinations, num_threads=3, batch_size=5):
 
     # Get property URLs
     print("Scraping property URLs...")
-    property_urls = scrape_property_urls(search_urls)
+
+    # Apply testing limit if set
+    max_properties = TEST_MAX_PROPERTIES if TEST_MAX_PROPERTIES else 500
+    property_urls = scrape_property_urls(search_urls, max_links=max_properties)
+
     print(f"Found {len(property_urls)} properties")
 
     if not property_urls:
         print("No properties found")
+        print("\nPossible reasons:")
+        print("1. Booking.com has changed their HTML structure")
+        print("2. Anti-bot detection is blocking the scraper")
+        print("3. The search returned no results")
+        print("\nTry:")
+        print("- Running with a VPN or proxy")
+        print("- Adding more delays between requests")
+        print("- Checking if the cities have properties on Booking.com")
         return
 
     # Divide URLs among threads
-    chunk_size = len(property_urls) // num_threads
+    chunk_size = len(property_urls) // num_threads if num_threads > 0 else len(property_urls)
     url_chunks = []
 
     for i in range(num_threads):
@@ -847,8 +915,9 @@ def scrape_booking_properties(destinations, num_threads=3, batch_size=5):
 
     print(f"Divided into {len(url_chunks)} chunks: {[len(chunk) for chunk in url_chunks]}")
 
-    # Setup output file
-    filename = f'booking_properties_{"-".join(destinations).lower()}.csv'
+    # Setup output file with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'/app/results/booking_properties_{"-".join(destinations).lower()}_{timestamp}.csv'
 
     # Start threads
     print(f"Starting {len(url_chunks)} threads...")
@@ -875,7 +944,10 @@ def scrape_single_threaded(destinations, batch_size=10):
     print("=== SINGLE-THREADED SCRAPER ===")
 
     search_urls = build_urls(destinations)
-    property_urls = scrape_property_urls(search_urls)
+
+    # Apply testing limit if set
+    max_properties = TEST_MAX_PROPERTIES if TEST_MAX_PROPERTIES else 500
+    property_urls = scrape_property_urls(search_urls, max_links=max_properties)
 
     if not property_urls:
         print("No properties found")
@@ -883,8 +955,9 @@ def scrape_single_threaded(destinations, batch_size=10):
 
     print(f"Found {len(property_urls)} properties")
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
-    filename = f'booking_properties_single_{"-".join(destinations).lower()}.csv'
+    driver = init_driver()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'/app/results/booking_properties_single_{"-".join(destinations).lower()}_{timestamp}.csv'
 
     batch = []
     processed = 0
@@ -924,15 +997,9 @@ def scrape_single_threaded(destinations, batch_size=10):
 
 
 if __name__ == "__main__":
-    cities = ["Tangier"]
+    # Set environment variable to indicate running in Docker
 
-    print("Choose scraping mode:")
-    print("1. Multi-threaded (faster)")
-    print("2. Single-threaded (more stable)")
+    cities = ["Marrakech", "Tangier"]
 
-    choice = input("Enter choice (1 or 2): ").strip()
 
-    if choice == "2":
-        scrape_single_threaded(cities, batch_size=5)
-    else:
-        scrape_booking_properties(cities, num_threads=3, batch_size=5)
+    scrape_booking_properties(cities, num_threads=3, batch_size=5)
