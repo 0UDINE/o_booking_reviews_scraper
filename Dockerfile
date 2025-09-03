@@ -14,4 +14,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Set the default command to run your scraper script
-CMD ["python", "multi_thread_booking_scraper.py"]
+CMD ["python", "booking_wifi_score_scraper.py"]

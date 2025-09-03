@@ -11,6 +11,7 @@ services:
     volumes:
       - ./results:/app/results
 
+
   selenium:
     image: selenium/standalone-chrome:latest
     shm_size: '2gb'

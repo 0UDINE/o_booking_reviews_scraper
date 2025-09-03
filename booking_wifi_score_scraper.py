@@ -12,8 +12,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 import os
-from selenium.webdriver.support.ui import Select
-from collections import defaultdict
 import requests
 from datetime import date, timedelta, datetime
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
@@ -24,7 +22,6 @@ csv_lock = threading.Lock()
 # === TESTING LIMITS ===
 # Set these to None or 0 to disable the limits
 TEST_MAX_PROPERTIES = 200  # scrape only first 200 properties
-TEST_MAX_REVIEW_PAGES = 20  # first page + one extra page (click next once)
 
 
 def init_driver():
@@ -106,10 +103,6 @@ def scrape_property_urls(urls, max_links=500):
                 print("Cookie consent accepted")
             except TimeoutException:
                 print("No cookie consent button found")
-
-            # Debug: Save page source to check what we're getting
-            with open('/app/results/debug_page.html', 'w', encoding='utf-8') as f:
-                f.write(driver.page_source[:10000])  # Save first 10k chars for debugging
 
             # Try multiple selectors for property links
             property_selectors = [
@@ -214,174 +207,6 @@ def scrape_property_urls(urls, max_links=500):
     return all_urls
 
 
-def normalize_traveler_type(traveler_type):
-    """Normalize traveler type names to valid field names"""
-    normalized = traveler_type.lower().replace(' ', '_').replace('-', '_')
-    mappings = {
-        'couple': 'couples',
-        'group': 'groups_friends',
-        'solo_traveler': 'solo_travelers',
-        'solo_traveller': 'solo_travelers',
-        'group_of_friends': 'groups_friends',
-        'families': 'families',
-        'family': 'families',
-        'business_traveller': 'business_travellers',
-        'business_traveler': 'business_travellers'
-    }
-    return mappings.get(normalized, normalized)
-
-
-def process_reviews_by_traveler_type(driver, prefix=""):
-    """Process all reviews and categorize by traveler type"""
-    traveler_scores = defaultdict(list)
-
-    try:
-        # Select "ALL" customer type to get all reviews with traveler types
-        select = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'select[name="customerType"]'))
-        )
-        select_element = Select(select)
-        select_element.select_by_value("ALL")
-        print(f"{prefix}Selected 'ALL' customer type")
-        time.sleep(2)
-
-        page_count = 0
-        while True:
-            page_count += 1
-            print(f"{prefix}Processing reviews page {page_count}")
-
-            try:
-                # Wait for review cards to load
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, '[data-testid="review-card"]'))
-                )
-                review_cards = driver.find_elements(By.CSS_SELECTOR, '[data-testid="review-card"]')
-                print(f"{prefix}Found {len(review_cards)} reviews on page {page_count}")
-
-                # Process each review card
-                for i, card in enumerate(review_cards):
-                    try:
-                        # Extract score
-                        score_text = card.find_element(By.XPATH, './/div[contains(text(), "Scored")]').text
-                        score = float(score_text.split("Scored ")[1].strip())
-
-                        # Extract traveler type
-                        traveler_type = "Unknown"
-                        try:
-                            traveler_element = card.find_element(By.CSS_SELECTOR,
-                                                                 '[data-testid="review-traveler-type"]')
-                            traveler_type = traveler_element.text.strip() or "Unknown"
-                        except:
-                            pass
-
-                        # Store score by traveler type
-                        if traveler_type != "Unknown":
-                            traveler_scores[traveler_type].append(score)
-
-                    except Exception as e:
-                        print(f"{prefix}Error processing review card {i + 1}: {e}")
-
-                # Stop after limited pages in testing mode
-                if TEST_MAX_REVIEW_PAGES and page_count >= TEST_MAX_REVIEW_PAGES:
-                    print(f"{prefix}Reached testing limit of review pages ({TEST_MAX_REVIEW_PAGES})")
-                    break
-
-                # Try to go to next page
-                try:
-                    next_btn = WebDriverWait(driver, 3).until(
-                        EC.element_to_be_clickable(
-                            (By.XPATH, '//*[@id="reviewCardsSection"]/div[2]/div[1]/div/div/div[3]/button'))
-                    )
-
-                    if "disabled" in next_btn.get_attribute("class"):
-                        print(f"{prefix}Reached last page")
-                        break
-
-                    next_btn.click()
-                    time.sleep(2)
-                    print(f"{prefix}Moved to next page")
-
-                except:
-                    print(f"{prefix}No next page available")
-                    break
-
-            except Exception as e:
-                print(f"{prefix}Error processing page {page_count}: {e}")
-                break
-
-        # Process specific traveler categories if available
-        try:
-            select = driver.find_element(By.CSS_SELECTOR, 'select[name="customerType"]')
-            available_options = [opt.get_attribute('value') for opt in select.find_elements(By.TAG_NAME, 'option')]
-
-            if "BUSINESS_TRAVELLERS" in available_options:
-                business_scores = process_specific_traveler_category(driver, "BUSINESS_TRAVELLERS", prefix)
-                if business_scores:
-                    traveler_scores["Business travellers"].extend(business_scores)
-        except Exception as e:
-            print(f"{prefix}Error processing specific categories: {e}")
-
-    except Exception as e:
-        print(f"{prefix}Error in traveler type processing: {e}")
-
-    return dict(traveler_scores)
-
-
-def process_specific_traveler_category(driver, category_value, prefix=""):
-    """Process reviews for a specific traveler category"""
-    scores = []
-
-    try:
-        select = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'select[name="customerType"]'))
-        )
-        select_element = Select(select)
-        select_element.select_by_value(category_value)
-        print(f"{prefix}Processing {category_value} reviews")
-        time.sleep(2)
-
-        page_count = 0
-        while True:
-            page_count += 1
-            # Stop after limited pages when testing
-            if TEST_MAX_REVIEW_PAGES and page_count > TEST_MAX_REVIEW_PAGES:
-                print(f"{prefix}Reached review page limit ({TEST_MAX_REVIEW_PAGES})")
-                break
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, '[data-testid="review-card"]'))
-                )
-                review_cards = driver.find_elements(By.CSS_SELECTOR, '[data-testid="review-card"]')
-
-                for card in review_cards:
-                    try:
-                        score_text = card.find_element(By.XPATH, './/div[contains(text(), "Scored")]').text
-                        score = float(score_text.split("Scored ")[1].strip())
-                        scores.append(score)
-                    except:
-                        pass
-
-                # Try next page
-                try:
-                    next_btn = WebDriverWait(driver, 3).until(
-                        EC.element_to_be_clickable(
-                            (By.XPATH, '//*[@id="reviewCardsSection"]/div[2]/div[1]/div/div/div[3]/button'))
-                    )
-                    if "disabled" in next_btn.get_attribute("class"):
-                        break
-                    next_btn.click()
-                    time.sleep(2)
-                except:
-                    break
-            except:
-                break
-
-    except Exception as e:
-        print(f"{prefix}Error processing {category_value}: {e}")
-
-    return scores
-
-
 def get_location_details(lat, lon):
     """Reverse-geocode latitude/longitude to address, zone and city (using Nominatim)."""
     try:
@@ -404,7 +229,7 @@ def get_location_details(lat, lon):
         if address:
             address = address.replace(",", " ")
 
-        # Extract zone (neighbourhood/suburb…)
+        # Extract zone (neighbourhood/suburb...)
         zone = None
         for field in [
             "neighbourhood",
@@ -456,7 +281,7 @@ def extract_prices(driver):
                 except ValueError:
                     pass
     except Exception:
-        pass  # timeout or structure changed — continue with fallbacks
+        pass  # timeout or structure changed – continue with fallbacks
 
     # --- Fallback: generic selectors ---
     if not prices:
@@ -536,7 +361,7 @@ def extract_coordinates(page_source):
 
 
 def scrape_property_data(driver, url, thread_id=None):
-    """Scrape detailed data for a single property"""
+    """Scrape basic data for a single property"""
     prefix = f"Thread {thread_id}: " if thread_id else ""
     print(f"{prefix}Scraping: {url}")
 
@@ -547,20 +372,7 @@ def scrape_property_data(driver, url, thread_id=None):
         'category': None,
         'general_review': None,
         'general_review_count': None,
-        'comfort_score': None,
-        'value_score': None,
-        'location_score': None,
         'wifi_score': None,
-        'avg_review_score_all': None,
-        'avg_review_score_all_count': None,
-        'avg_review_score_families': None,
-        'avg_review_score_families_count': None,
-        'avg_review_score_couples': None,
-        'avg_review_score_couples_count': None,
-        'avg_review_score_solo_travelers': None,
-        'avg_review_score_solo_travelers_count': None,
-        'avg_review_score_business_travellers': None,
-        'avg_review_score_business_travellers_count': None,
         'min_price': None,
         'max_price': None,
         'latitude': None,
@@ -593,123 +405,43 @@ def scrape_property_data(driver, url, thread_id=None):
         except:
             data['wifi_speed'] = 'Not specified'
 
-        # Extract reviews and process by traveler type
+        # Extract basic review info
         try:
-            # Click the reviews link/score card and handle possible new window/tab
-            parent_handle = driver.current_window_handle
-            handles_before = driver.window_handles
-
-            # Try multiple selectors because Booking may render the button differently per property
-            review_selectors = [
-                (By.XPATH, "//*[@id='js--hp-gallery-scorecard']"),
-                (By.CSS_SELECTOR, "a[data-testid='see-all-reviews-link']"),
-                (By.CSS_SELECTOR, "a[href*='#tab-reviews']"),
-            ]
-
-            clicked = False
-            for by, selector in review_selectors:
-                try:
-                    review_btn = WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((by, selector))
-                    )
-                    review_btn.click()
-                    clicked = True
-                    break
-                except Exception:
-                    continue
-
-            if not clicked:
-                print(f"{prefix}Unable to locate reviews link with known selectors")
-                raise Exception("Reviews link not found")
-
-            # Wait a moment for potential new window/tab to appear and identify it
-            time.sleep(2)
-            handles_after = driver.window_handles
-            new_window = None
-            for h in handles_after:
-                if h not in handles_before:
-                    new_window = h
-                    break
-
-            if new_window:
-                driver.switch_to.window(new_window)
-
-            # Ensure the reviews section has loaded in the active window (new or same)
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, '[data-testid="review-card"]'))
+            # General review score
+            general_element = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, '//*[@id="js--hp-gallery-scorecard"]/a/div/div/div/div[2]'))
             )
+            data['general_review'] = float(general_element.get_attribute("textContent"))
+        except:
+            pass
 
-            # Extract basic scores
-            score_xpaths = [
-                ('comfort_score', '(//div[@data-testid="review-subscore"]//div[@aria-hidden="true"])[4]'),
-                ('value_score', '(//div[@data-testid="review-subscore"]//div[@aria-hidden="true"])[5]'),
-                ('location_score', '(//div[@data-testid="review-subscore"]//div[@aria-hidden="true"])[6]'),
-                ('wifi_score', '(//div[@data-testid="review-subscore"]//div[@aria-hidden="true"])[7]'),
-            ]
+        try:
+            # General review count
+            count_element = driver.find_element(By.XPATH,
+                                                '//*[@id="js--hp-gallery-scorecard"]/a/div/div/div/div[4]/div[2]')
+            count_text = ''.join(filter(str.isdigit, count_element.text))
+            if count_text:
+                data['general_review_count'] = int(count_text)
+        except:
+            pass
 
-            for score_key, xpath in score_xpaths:
-                try:
-                    element = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, xpath)))
-                    data[score_key] = float(element.get_attribute("textContent"))
-                except:
-                    pass
+        # Extract WiFi score from reviews section
+        try:
+            # Navigate to reviews to get WiFi score
+            review_btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//*[@id='js--hp-gallery-scorecard']"))
+            )
+            review_btn.click()
+            time.sleep(2)
 
-            # General score and count
-            try:
-                general_element = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, '//*[@id="js--hp-gallery-scorecard"]/a/div/div/div/div[2]'))
-                )
-                data['general_review'] = float(general_element.get_attribute("textContent"))
-            except:
-                pass
-
-            try:
-                count_element = driver.find_element(By.XPATH,
-                                                    '//*[@id="js--hp-gallery-scorecard"]/a/div/div/div/div[4]/div[2]')
-                count_text = ''.join(filter(str.isdigit, count_element.text))
-                if count_text:
-                    data['general_review_count'] = int(count_text)
-            except:
-                pass
-
-            # Process reviews by traveler type
-            print(f"{prefix}Processing reviews by traveler type...")
-            traveler_scores = process_reviews_by_traveler_type(driver, prefix)
-
-            # Update data with traveler type averages
-            for traveler_type, scores in traveler_scores.items():
-                if scores:
-                    normalized_type = normalize_traveler_type(traveler_type)
-                    score_field = f'avg_review_score_{normalized_type}'
-                    count_field = f'avg_review_score_{normalized_type}_count'
-
-                    # Ensure the field exists in our data structure
-                    data[score_field] = sum(scores) / len(scores)
-                    data[count_field] = len(scores)
-
-                    print(f"{prefix}{traveler_type} -> {score_field}: {data[score_field]:.2f} ({len(scores)} reviews)")
-
-            # Also set the 'all' category data if we have traveler scores
-            all_scores = []
-            for scores in traveler_scores.values():
-                all_scores.extend(scores)
-
-            if all_scores:
-                data['avg_review_score_all'] = sum(all_scores) / len(all_scores)
-                data['avg_review_score_all_count'] = len(all_scores)
-                print(f"{prefix}All travelers: {data['avg_review_score_all']:.2f} ({len(all_scores)} reviews)")
-
-            # Close the reviews tab/window and switch back to property page if we opened a new one
-            if new_window:
-                try:
-                    driver.close()
-                except Exception:
-                    pass
-                driver.switch_to.window(parent_handle)
-
+            # Extract WiFi score
+            wifi_element = driver.find_element(
+                By.XPATH, '(//div[@data-testid="review-subscore"]//div[@aria-hidden="true"])[7]'
+            )
+            data['wifi_score'] = float(wifi_element.get_attribute("textContent"))
         except Exception as e:
-            print(f"{prefix}Error extracting reviews: {e}")
+            print(f"{prefix}Error extracting WiFi score: {e}")
 
         # Extract coordinates and location
         try:
@@ -738,22 +470,7 @@ def get_all_possible_fields():
         'category',
         'general_review',
         'general_review_count',
-        'comfort_score',
-        'value_score',
-        'location_score',
         'wifi_score',
-        'avg_review_score_all',
-        'avg_review_score_all_count',
-        'avg_review_score_families',
-        'avg_review_score_families_count',
-        'avg_review_score_couples',
-        'avg_review_score_couples_count',
-        'avg_review_score_solo_travelers',
-        'avg_review_score_solo_travelers_count',
-        'avg_review_score_business_travellers',
-        'avg_review_score_business_travellers_count',
-        'avg_review_score_groups_friends',
-        'avg_review_score_groups_friends_count',
         'min_price',
         'max_price',
         'latitude',
@@ -770,39 +487,16 @@ def save_to_csv(data_list, filename):
     if not data_list:
         return
 
-    # Use predefined field order
-    base_fields = get_all_possible_fields()
-
-    # Also collect any dynamic fields from the data
-    dynamic_fields = set()
-    for item in data_list:
-        for key in item.keys():
-            if key not in base_fields:
-                dynamic_fields.add(key)
-
-    # Combine base fields with any new dynamic fields
-    fieldnames = base_fields + sorted(list(dynamic_fields))
+    fieldnames = get_all_possible_fields()
 
     with csv_lock:
-        # Check if file exists and get existing headers
+        # Check if file exists
         file_exists = False
-        existing_fieldnames = []
-
         try:
             with open(filename, 'r', newline='', encoding='utf-8') as csvfile:
-                reader = csv.DictReader(csvfile)
-                existing_fieldnames = reader.fieldnames or []
                 file_exists = True
         except FileNotFoundError:
             pass
-
-        # If file exists, merge fieldnames to include any new fields
-        if file_exists and existing_fieldnames:
-            all_fieldnames = list(existing_fieldnames)
-            for field in fieldnames:
-                if field not in all_fieldnames:
-                    all_fieldnames.append(field)
-            fieldnames = all_fieldnames
 
         mode = 'a' if file_exists else 'w'
 
@@ -821,10 +515,8 @@ def save_to_csv(data_list, filename):
                         row[field] = item[field]
                     else:
                         # Set appropriate default values
-                        if field == 'property_url':
-                            row[field] = item.get('property_url', '')
-                        elif field in ['category', 'address', 'zone', 'city', 'wifi_speed']:
-                            row[field] = ''  # Empty string instead of None for text fields
+                        if field in ['category', 'address', 'zone', 'city', 'wifi_speed']:
+                            row[field] = ''  # Empty string for text fields
                         elif field in ['latitude', 'longitude']:
                             row[field] = ''  # Empty string for coordinates
                         else:
@@ -997,7 +689,5 @@ def scrape_single_threaded(destinations, batch_size=10):
 
 
 if __name__ == "__main__":
-
     cities = ["Marrakech", "Tangier"]
-
-    scrape_booking_properties(cities, num_threads=3, batch_size=5)
+    scrape_single_threaded(cities, batch_size=5)
