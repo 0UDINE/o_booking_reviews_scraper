@@ -689,5 +689,5 @@ def scrape_single_threaded(destinations, batch_size=10):
 
 
 if __name__ == "__main__":
-    cities = ["Marrakech", "Tangier"]
+    cities = ["Tangier"]
     scrape_single_threaded(cities, batch_size=5)
