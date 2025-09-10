@@ -38,9 +38,10 @@ def init_driver():
     chrome_options.add_experimental_option('useAutomationExtension', False)
     chrome_options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
-
+    chrome_options.add_argument('--ignore-ssl-errors=yes')
+    chrome_options.add_argument('--ignore-certificate-errors')
     # Connect to the Selenium Hub/Node using the service name from docker-compose.yml
-    selenium_url = os.environ.get('SELENIUM_URL', 'http://selenium:4444/wd/hub')
+    selenium_url = os.environ.get('SELENIUM_URL', 'http://localhost:4444')
 
     driver = webdriver.Remote(
         command_executor=selenium_url,
