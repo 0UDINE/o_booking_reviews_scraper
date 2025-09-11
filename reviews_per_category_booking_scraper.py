@@ -23,8 +23,8 @@ csv_lock = threading.Lock()
 
 # === TESTING LIMITS ===
 # Set these to None or 0 to disable the limits
-TEST_MAX_PROPERTIES = 200  # scrape only first 200 properties
-TEST_MAX_REVIEW_PAGES = 20  # first page + one extra page (click next once)
+TEST_MAX_PROPERTIES = 500  # scrape only first 200 properties
+TEST_MAX_REVIEW_PAGES = 20
 
 
 def init_driver():
@@ -231,7 +231,7 @@ def normalize_traveler_type(traveler_type):
     return mappings.get(normalized, normalized)
 
 
-def process_reviews_by_traveler_type(driver, prefix=""):
+def process_reviews_by_traveler_type(driver, target_year=None,prefix=""):
     """Process all reviews and categorize by traveler type"""
     traveler_scores = defaultdict(list)
 
@@ -244,6 +244,16 @@ def process_reviews_by_traveler_type(driver, prefix=""):
         select_element.select_by_value("ALL")
         print(f"{prefix}Selected 'ALL' customer type")
         time.sleep(2)
+
+        # Select "Newest first" customer type to get all reviews ordered by review date descending
+        select = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'select[name="reviewListSorters"]'))
+        )
+        select_element = Select(select)
+        select_element.select_by_value("NEWEST_FIRST")
+        print(f"{prefix}Selected 'NEWEST_FIRST'")
+        time.sleep(2)
+
 
         page_count = 0
         while True:
@@ -264,6 +274,31 @@ def process_reviews_by_traveler_type(driver, prefix=""):
                         # Extract score
                         score_text = card.find_element(By.XPATH, './/div[contains(text(), "Scored")]').text
                         score = float(score_text.split("Scored ")[1].strip())
+
+                        # Extract review year date
+                        review_year_date = "Unknown"
+                        try:
+                            traveler_element = card.find_element(By.CSS_SELECTOR,
+                                                                 '[data-testid="review-stay-date"]')
+                            review_year_date = traveler_element.text.strip() or "Unknown"
+                        except:
+                            pass
+
+                        # FILTER BY TARGET YEAR IF SPECIFIED
+                        if target_year and review_year_date != "Unknown":
+                            try:
+                                year_match = re.search(r'\b(20\d{2})\b', review_year_date)
+                                if year_match:
+                                    review_year = int(year_match.group(1))
+                                    if review_year != target_year:
+                                        continue  # Skip this review if year doesn't match
+                                else:
+                                    continue  # Skip if we can't extract year
+                            except:
+                                continue  # Skip if error in year extraction
+
+
+
 
                         # Extract traveler type
                         traveler_type = "Unknown"
@@ -315,7 +350,7 @@ def process_reviews_by_traveler_type(driver, prefix=""):
             available_options = [opt.get_attribute('value') for opt in select.find_elements(By.TAG_NAME, 'option')]
 
             if "BUSINESS_TRAVELLERS" in available_options:
-                business_scores = process_specific_traveler_category(driver, "BUSINESS_TRAVELLERS", prefix)
+                business_scores = process_specific_traveler_category(driver, "BUSINESS_TRAVELLERS", target_year, prefix)
                 if business_scores:
                     traveler_scores["Business travellers"].extend(business_scores)
         except Exception as e:
@@ -327,7 +362,8 @@ def process_reviews_by_traveler_type(driver, prefix=""):
     return dict(traveler_scores)
 
 
-def process_specific_traveler_category(driver, category_value, prefix=""):
+def process_specific_traveler_category(driver, category_value, target_year=None, prefix=""):
+
     """Process reviews for a specific traveler category"""
     scores = []
 
@@ -357,6 +393,20 @@ def process_specific_traveler_category(driver, category_value, prefix=""):
                     try:
                         score_text = card.find_element(By.XPATH, './/div[contains(text(), "Scored")]').text
                         score = float(score_text.split("Scored ")[1].strip())
+                        if target_year:
+                            try:
+                                review_year_date_elem = card.find_element(By.CSS_SELECTOR,
+                                                                          '[data-testid="review-stay-date"]')
+                                review_year_date = review_year_date_elem.text.strip()
+                                year_match = re.search(r'\b(20\d{2})\b', review_year_date)
+                                if year_match:
+                                    review_year = int(year_match.group(1))
+                                    if review_year != target_year:
+                                        continue
+                                else:
+                                    continue
+                            except:
+                                continue
                         scores.append(score)
                     except:
                         pass
@@ -535,7 +585,7 @@ def extract_coordinates(page_source):
     return None, None
 
 
-def scrape_property_data(driver, url, thread_id=None):
+def scrape_property_data(driver, url,target_year=None, thread_id=None):
     """Scrape detailed data for a single property"""
     prefix = f"Thread {thread_id}: " if thread_id else ""
     print(f"{prefix}Scraping: {url}")
@@ -675,7 +725,8 @@ def scrape_property_data(driver, url, thread_id=None):
 
             # Process reviews by traveler type
             print(f"{prefix}Processing reviews by traveler type...")
-            traveler_scores = process_reviews_by_traveler_type(driver, prefix)
+            traveler_scores = process_reviews_by_traveler_type(driver, target_year, prefix)
+
 
             # Update data with traveler type averages
             for traveler_type, scores in traveler_scores.items():
@@ -734,6 +785,7 @@ def get_all_possible_fields():
     return [
         'property_id',
         'scrape_timestamp',
+        'filtered_year',
         'property_url',
         'category',
         'general_review',
@@ -835,7 +887,7 @@ def save_to_csv(data_list, filename):
     print(f"Saved {len(data_list)} properties to {filename}")
 
 
-def worker_thread(urls_chunk, thread_id, filename, batch_size=5):
+def worker_thread(urls_chunk, thread_id, filename, target_year=None, batch_size=5):
     """Worker function for threading"""
     print(f"Thread {thread_id}: Starting with {len(urls_chunk)} properties")
 
@@ -847,7 +899,9 @@ def worker_thread(urls_chunk, thread_id, filename, batch_size=5):
     try:
         for i, url in enumerate(urls_chunk, 1):
             try:
-                data = scrape_property_data(driver, url, thread_id)
+                data = scrape_property_data(driver, url, target_year, thread_id)
+                if target_year:
+                    data['filtered_year'] = target_year
                 batch.append(data)
                 processed += 1
 
@@ -874,7 +928,7 @@ def worker_thread(urls_chunk, thread_id, filename, batch_size=5):
         print(f"Thread {thread_id}: Completed - processed {processed} properties")
 
 
-def scrape_booking_properties(destinations, num_threads=3, batch_size=5):
+def scrape_booking_properties(destinations, target_year=None, num_threads=3, batch_size=5):
     """Main scraping function"""
     print("=== BOOKING.COM SCRAPER ===")
 
@@ -924,7 +978,7 @@ def scrape_booking_properties(destinations, num_threads=3, batch_size=5):
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = []
         for i, chunk in enumerate(url_chunks):
-            future = executor.submit(worker_thread, chunk, i + 1, filename, batch_size)
+            future = executor.submit(worker_thread, chunk, i + 1, filename, target_year, batch_size)
             futures.append(future)
 
         # Wait for completion
@@ -939,7 +993,7 @@ def scrape_booking_properties(destinations, num_threads=3, batch_size=5):
     print(f"Results saved to: {filename}")
 
 
-def scrape_single_threaded(destinations, batch_size=10):
+def scrape_single_threaded(destinations, target_year=None, batch_size=10):
     """Single-threaded version for comparison"""
     print("=== SINGLE-THREADED SCRAPER ===")
 
@@ -967,7 +1021,7 @@ def scrape_single_threaded(destinations, batch_size=10):
             print(f"Processing {i}/{len(property_urls)}")
 
             try:
-                data = scrape_property_data(driver, url)
+                data = scrape_property_data(driver, url, target_year)
                 batch.append(data)
                 processed += 1
 
@@ -1000,4 +1054,5 @@ if __name__ == "__main__":
 
     cities = ["Marrakech", "Tangier"]
 
-    scrape_booking_properties(cities, num_threads=3, batch_size=5)
+    target_year = 2025
+    scrape_booking_properties(cities, target_year=target_year, num_threads=1, batch_size=5)
